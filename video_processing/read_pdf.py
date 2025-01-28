@@ -2,90 +2,260 @@ import pdfplumber
 from typing import List
 import re
 
-game_times = []          ##placing of this might be wrong??
-clip_tuples = []
-home_players = []
-away_players = []
+# this is not properly working because out of bounds
+# are not documented on box score
 
-#might delete
-def write_to_file(d, output_file: str):
-    try:
-        with open(output_file, 'w') as file:
-            for item in d:
-                file.write(f"{item}\n")
-    except Exception as e:
-        print(f"An error occurred while writing to the file: {e}")
 
-def create_clip_tuples():
-    global game_times
-    global clip_tuples
-    time_tuples = []
-    # helper method
-    def convert_to_seconds(time_str):
-        minutes, seconds = map(int, time_str.split(":"))
-        return minutes * 60 + seconds
-    #helper method
-    def quarter_convertor():
-        quarter = 1
-        for t in time_tuples:
-            first = t[0]
-            second = t[1]
-            if quarter == 1:
-                clip_tuples.append((600 - first, 600 - second))
-            elif quarter == 2:
-                clip_tuples.append((1200 - first, 1200 - second)) #these also might be wrong
-            elif quarter ==3:
-                clip_tuples.append((1800 - first, 1800 - second))
-            elif quarter == 4:
-                clip_tuples.append((2400 - first, 2400 - second))
-            if second == 600:
-                quarter += 1 #this is wrong
+raw_jump_ball_time = "" #Stores the time of the jump ball in "MM:SS" format.
+home_players = [] #List of players on the home team.
+away_players = [] #List of players on the away team.
+previous_time = None #Stores the last timestamp processed.
+clean_clips = [] #List of cleaned and adjusted clip tuples.
 
-    for i in range(len(game_times) - 1):
-        if game_times[i] != game_times[i+1]:
-            start_seconds = convert_to_seconds(game_times[i])
-            end_seconds = convert_to_seconds(game_times[i + 1])
-            if start_seconds < end_seconds:
-                time_tuples.append((start_seconds, 0))
-            else:
-                time_tuples.append((start_seconds, end_seconds))
-    quarter_convertor()
-
-def create_time_array(d):
-    global game_times
-    time_pattern = r'\b([0-9]{2}):([0-9]{2})\b'
-    #insert game start time.
-    if not game_times:
-        game_times.append("10:00")
-    for row in d:
-        for item in row:
-            times = re.findall(time_pattern, item)
-            for time in times:
-                game_times.append(f"{time[0]}:{time[1]}")
-
-def create_player_arrays(d):
-    global home_players, away_players
-    player_pattern = r'\b([A-Za-z]+,[A-Za-z]+)\b'
-    header_count = 0
-    for row in d:
-        whole_row = " ".join(row)
-        if whole_row == "# Player GS MIN FG 3PT FT ORB-DRB REB PF A TO BLK STL PTS":
-            header_count += 1
+def cleanup_clip_tuples(clips):
+    """
+       Adjusts clip times based on the quarter and ensures proper alignment.
+       Parameters:
+           clips (List[Tuple[int, int]]): List of start and end times for clips.
+       Global Variables:
+           clean_clips, raw_jump_ball_time
+    """
+    quarter = 1
+    global clean_clips
+    global raw_jump_ball_time
+    jump_ball_time = time_to_seconds(raw_jump_ball_time)
+    for group in clips:
+        start, end = group
+        start += jump_ball_time
+        end += jump_ball_time
+        if group == clips[0] and start != 0:
+            clean_clips.append((0 + jump_ball_time, start))
+        if start == end:
             continue
-        if header_count == 1:
-            for item in row:
-                players = re.findall(player_pattern, item)
-                if players:
-                    away_players.extend(players)
-        elif header_count == 2:
-            for item in row:
-                players = re.findall(player_pattern, item)
-                if players:
-                    home_players.extend(players)
-        if header_count >= 2 and "1st Play By Play" in whole_row:
-            break
+        elif start > end:
+            quarter += 1
+            if start != (600 + jump_ball_time):
+                clean_clips.append(((quarter - 1) * 600 - (600 - start), (quarter - 1) * 600))
+                clean_clips.append(((quarter - 1) * 600, (quarter - 1) * 600 + end))
+            else:
+                clean_clips.append(((quarter - 1) * 600 , (quarter - 1) * 600 + end ))
+        elif quarter == 1:
+            clean_clips.append((start, end))
+        elif quarter == 2:
+            clean_clips.append((start + 600, end + 600))
+        elif quarter == 3:
+            clean_clips.append((start + 1200, end + 1200))
+        elif quarter == 4:
+            clean_clips.append((start + 1800, end + 1800))
+
+def create_clip_tuples(tuples):
+    """
+       Processes actions like "GOOD," "MISS," and timeouts to create intervals.
+       Parameters:
+           tuples (List[Tuple[str, int, str]]): List of action, timestamp, and player info.
+       Global Variables:
+           clean_clips
+    """
+    clips = []
+    last_clip_time = None
+    last_player = None
+    last_timeout_time = None
+    total_timeout_adjustment = 0  # Track the total timeout adjustment
+    for group in tuples:
+        action = group[0]
+        time = group[1]
+        player = group[2]
+        rebound_team = home_or_away(player, last_player)
+        # Adjust clip times based on timeouts
+        if action == "GOOD":
+            if last_clip_time is not None:
+                clips.append((600 - last_clip_time + total_timeout_adjustment, 600 - time + total_timeout_adjustment))
+            last_clip_time = time
+            last_player = player
+        elif action == "MISS":
+            if last_clip_time is not None:
+                if rebound_team == 0:
+                    clips.append((600 - last_clip_time + total_timeout_adjustment, 600 - time + total_timeout_adjustment))
+                last_clip_time = time
+            last_player = player
+        elif action == "TIMEOUT 30SEC" or action == "TIMEOUT MEDIA" or action == "TIMEOUT 60SEC":
+            # Only add a timeout if the last action wasn't already a timeout
+            if last_timeout_time != time:
+                if action == "TIMEOUT 30SEC":
+                    clips.append((600 - last_clip_time + total_timeout_adjustment - 5, 600 - time + 35 + total_timeout_adjustment))
+                    total_timeout_adjustment += 35
+                elif action == "TIMEOUT MEDIA" or action == "TIMEOUT 60SEC":
+                    clips.append((600 - last_clip_time + total_timeout_adjustment - 5, 600 - time + 65 + total_timeout_adjustment))
+                    total_timeout_adjustment += 65
+                last_timeout_time = time
+    cleanup_clip_tuples(clips)
+
+def home_or_away(player, previous_player):
+    """
+        Checks if the action involves the home or away team.
+        Parameters:
+            player (str): Current player involved in the action.
+            previous_player (str): Last player involved in an action.
+        Returns:
+            int: 1 if from the same team as the previous action, 0 otherwise.
+        Global Variables:
+            home_players, away_players
+    """
+    if player in home_players and previous_player in home_players:
+        return 1
+    elif player in away_players and previous_player in away_players:
+        return 1
+    elif player == "TEAM":
+        return 1
+    else:
+        return 0
+
+def create_action_tuples(d):
+    """
+        Extracts actions, timestamps, and players to create action tuples.
+        Parameters:
+            d (List[List[str]]): Parsed text data from the PDF.
+    """
+    action_tuples = []
+    for line in d:
+        action_type = find_key_words(line)
+        timestamp = find_timestamp_in_line(line)
+        player = find_player_team_in_line(line)
+        if player is None:
+            action_tuples.append((action_type, timestamp, player))
+        action_tuples.append((action_type, timestamp, player))
+    create_clip_tuples(action_tuples)
+
+def find_key_words(line):
+    """
+        Searches for action keywords.
+        Parameters:
+            line (List[str]): Words from a single line of text.
+        Returns:
+            Optional[str]: Action keyword or None if not found.
+    """
+    action_keywords = ["GOOD", "MISS", "FOUL", "REBOUND",
+                       "TURNOVER", "SUB", "ASSIST", "STEAL", "BLOCK"]
+    timeout_types = ["MEDIA", "30SEC", "60SEC"]
+    for i, item in enumerate(line):
+        if item in action_keywords:
+            return item
+        if item == "TIMEOUT":
+            if i + 1 < len(line) and line[i + 1] in timeout_types:
+                return f"TIMEOUT {line[i + 1]}"
+            return "TIMEOUT"
+    return None
+
+def find_timestamp_in_line(line):
+    """
+        Converts timestamp from "MM:SS" format to seconds.
+        Parameters:
+            line (List[str]): Words from a single line of text.
+        Returns:
+            int: Timestamp in seconds.
+        Global Variables:
+            previous_time
+    """
+    global previous_time
+    line = " ".join(line)
+    time_pattern = r'\b([0-9]{2}):([0-9]{2})\b'
+    time = re.findall(time_pattern, line)
+    if not time:
+        return previous_time
+    new_time = time_to_seconds(f"{time[0][0]}:{time[0][1]}")
+    previous_time = new_time
+    return new_time
+
+def time_to_seconds(time):
+    """
+        Converts time from "MM:SS" to total seconds.
+        Parameters:
+            time (str): Time in "MM:SS" format.
+        Returns:
+            int: Time in seconds.
+    """
+    minutes, seconds = map(int, time.split(':'))
+    return minutes * 60 + seconds
+
+def find_player_team_in_line(line):
+    """
+        Extracts the player or team name from a line.
+        Parameters:
+            line (List[str]): Words from a single line of text.
+        Returns:
+            Optional[str]: Player or team name, or None if not found.
+    """
+    line = " ".join(line)
+    player_pattern = r'\b([A-Za-z]+,[A-Za-z]+)\b'
+    team = "TEAM"
+    if team in line:
+        return team
+    player = re.findall(player_pattern, line)
+    if not player:
+        return None
+    return player[0]
+
+def create_player_arrays(d: List[List[str]]) -> None:
+   """
+       Extracts player names for home and away teams using a regular
+       expression pattern.
+
+       Parameters:
+           d (List[List[str]]): Parsed text data from the PDF.
+
+       Global Variables:
+           home_players, away_players
+    """
+   global home_players, away_players
+   player_pattern = r'\b([A-Za-z]+,[A-Za-z]+)\b'
+   header_count = 0
+   for row in d:
+       whole_row = " ".join(row)
+       if whole_row == "# Player GS MIN FG 3PT FT ORB-DRB REB PF A TO BLK STL PTS":
+           header_count += 1
+           continue
+       if header_count == 1:
+           for item in row:
+               players = re.findall(player_pattern, item)
+               if players:
+                   away_players.extend([player.lower() for player in players])
+       elif header_count == 2:
+           for item in row:
+               players = re.findall(player_pattern, item)
+               if players:
+                   home_players.extend([player.lower() for player in players])
+       if header_count >= 2 and "1st Play By Play" in whole_row:
+           break
+
+def get_jump_ball_time():
+    """
+        Ensures the user inputs a valid jump ball time in "MM:SS" format.
+        Global Variables:
+            raw_jump_ball_time
+    """
+    global raw_jump_ball_time
+    while True:  # Keep prompting until valid input is provided
+        try:
+            raw_jump_ball_time = input("What time is the jump ball thrown? (MM:SS): ").strip()
+            if ':' not in raw_jump_ball_time:
+                raise ValueError("Invalid format. Missing ':' separator.")
+            minutes, seconds = map(int, raw_jump_ball_time.split(":"))
+            if not (0 <= seconds < 60):
+                raise ValueError("Seconds must be between 0 and 59.")
+            break  # Exit the loop if input is valid
+        except ValueError as e:
+            print(f"Invalid time format: {e}. Please enter the time in MM:SS format (e.g., 10:45).")
 
 def load_pdf(file_path: str) -> List[List[str]]:
+    """
+        Extracts and processes text from a PDF.
+        Parameters:
+            file_path (str): Path to the PDF file.
+        Returns:
+            List[List[str]]: Parsed text data as lists of words.
+        Purpose:
+            Triggers the creation of player arrays and action tuples.
+    """
     data = []
     try:
         with pdfplumber.open(file_path) as pdf:
@@ -100,10 +270,8 @@ def load_pdf(file_path: str) -> List[List[str]]:
                     print(f"Page {page_num + 1} is empty or has no extractable text.")
     except Exception as e:
         print(f"An error occurred while opening the PDF: {e}")
+    get_jump_ball_time()
+    create_player_arrays(data)
+    create_action_tuples(data)
     return data
 
-#clips need to be changes to seconds starting from 0, the quarters also need to start at 0, 600, 1200, 1800
-#original video does not start at tip off
-#I need to make it so that the game_times are passed into the file in a tuple so that it can cut the clips
-#The timeouts need to be clipped at a different time
-#REDOUND could be O-Board
