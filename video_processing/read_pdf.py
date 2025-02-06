@@ -5,7 +5,6 @@ import re
 # this is not properly working because out of bounds
 # are not documented on box score
 
-
 raw_jump_ball_time = "" #Stores the time of the jump ball in "MM:SS" format.
 home_players = [] #List of players on the home team.
 away_players = [] #List of players on the away team.
@@ -61,6 +60,8 @@ def create_clip_tuples(tuples):
     last_player = None
     last_timeout_time = None
     total_timeout_adjustment = 0  # Track the total timeout adjustment
+    shot_padding = 4 #shot adjustment
+    turnover_padding = 7 #the ball must go out of bounds
     for group in tuples:
         action = group[0]
         time = group[1]
@@ -69,14 +70,19 @@ def create_clip_tuples(tuples):
         # Adjust clip times based on timeouts
         if action == "GOOD":
             if last_clip_time is not None:
-                clips.append((600 - last_clip_time + total_timeout_adjustment, 600 - time + total_timeout_adjustment))
+                clips.append((600 - last_clip_time + total_timeout_adjustment, 600 - time + total_timeout_adjustment + shot_padding))
             last_clip_time = time
             last_player = player
         elif action == "MISS":
             if last_clip_time is not None:
                 if rebound_team == 0:
-                    clips.append((600 - last_clip_time + total_timeout_adjustment, 600 - time + total_timeout_adjustment))
+                    clips.append((600 - last_clip_time + total_timeout_adjustment, 600 - time + total_timeout_adjustment + shot_padding))
                 last_clip_time = time
+            last_player = player
+        elif action == "TURNOVER":
+            if last_clip_time is not None:
+                clips.append((600 - last_clip_time + total_timeout_adjustment, 600 - time + total_timeout_adjustment + turnover_padding))
+            last_clip_time = time - turnover_padding
             last_player = player
         elif action == "TIMEOUT 30SEC" or action == "TIMEOUT MEDIA" or action == "TIMEOUT 60SEC":
             # Only add a timeout if the last action wasn't already a timeout
@@ -148,7 +154,9 @@ def find_key_words(line):
 
 def find_timestamp_in_line(line):
     """
-        Converts timestamp from "MM:SS" format to seconds.
+        Finds the timestamp in a line of code using a regular
+        expression pattern.
+
         Parameters:
             line (List[str]): Words from a single line of text.
         Returns:
@@ -166,20 +174,28 @@ def find_timestamp_in_line(line):
     previous_time = new_time
     return new_time
 
-def time_to_seconds(time):
+def time_to_seconds(time: str) -> int:
     """
-        Converts time from "MM:SS" to total seconds.
+        Converts a time string (HH:MM:SS or MM:SS) into total seconds.
         Parameters:
             time (str): Time in "MM:SS" format.
         Returns:
             int: Time in seconds.
     """
-    minutes, seconds = map(int, time.split(':'))
-    return minutes * 60 + seconds
+    parts = list(map(int, time.split(":")))
+    if len(parts) == 3:  # HH:MM:SS format
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:  # MM:SS format
+        hours = 0
+        minutes, seconds = parts
+    else:
+        raise ValueError("Invalid time format. Use HH:MM:SS or MM:SS.")
+    return hours * 3600 + minutes * 60 + seconds
+
 
 def find_player_team_in_line(line):
     """
-        Extracts the player or team name from a line.
+        Extracts the player or TEAM from a line.
         Parameters:
             line (List[str]): Words from a single line of text.
         Returns:
@@ -227,24 +243,31 @@ def create_player_arrays(d: List[List[str]]) -> None:
        if header_count >= 2 and "1st Play By Play" in whole_row:
            break
 
+
 def get_jump_ball_time():
     """
-        Ensures the user inputs a valid jump ball time in "MM:SS" format.
+        Ensures the user inputs a valid jump ball time in "HH:MM:SS" or "MM:SS" format.
         Global Variables:
             raw_jump_ball_time
     """
     global raw_jump_ball_time
-    while True:  # Keep prompting until valid input is provided
+    while True:
         try:
-            raw_jump_ball_time = input("What time is the jump ball thrown? (MM:SS): ").strip()
-            if ':' not in raw_jump_ball_time:
-                raise ValueError("Invalid format. Missing ':' separator.")
-            minutes, seconds = map(int, raw_jump_ball_time.split(":"))
-            if not (0 <= seconds < 60):
-                raise ValueError("Seconds must be between 0 and 59.")
-            break  # Exit the loop if input is valid
+            raw_jump_ball_time = input("What time is the jump ball thrown? (HH:MM:SS or MM:SS): ").strip()
+            parts = raw_jump_ball_time.split(":")
+            if len(parts) == 3:  # HH:MM:SS format
+                hours, minutes, seconds = map(int, parts)
+            elif len(parts) == 2:  # MM:SS format
+                hours = 0
+                minutes, seconds = map(int, parts)
+            else:
+                raise ValueError("Invalid format. Use HH:MM:SS or MM:SS.")
+            if not (0 <= minutes < 60 and 0 <= seconds < 60):
+                raise ValueError("Minutes and seconds must be within valid ranges.")
+            break
         except ValueError as e:
-            print(f"Invalid time format: {e}. Please enter the time in MM:SS format (e.g., 10:45).")
+            print(
+                f"Invalid time format: {e}. Please enter the time in HH:MM:SS or MM:SS format (e.g., 01:30:45 or 10:45).")
 
 def load_pdf(file_path: str) -> List[List[str]]:
     """
